@@ -1,0 +1,62 @@
+-- WBD eligible vs. received: Canada NV, Classic orders. 
+-- =========================== CHANGE SETTINGS HERE ONLY ===========================
+SET start_date          = '2026-10-12';  -- first day to include (Pacific time). Use a Monday for whole weeks.
+SET end_date            = '2026-10-19';  -- first day to EXCLUDE
+SET country_id          = 2;             -- 2 = Canada
+SET max_prior_nv_orders = 2;             -- eligible = 0 up to this many prior NV orders
+SET new_customer_days   = 14;            -- "first order within N days" bucket
+-- ============================== NO CHANGES BELOW ==============================
+
+WITH disc AS (
+    SELECT order_cart_id,
+           SUM(IFF("GROUP"='welcome_back_discount' AND monetary_field='delivery_fee', ROUND(amount), 0))/100.0 AS wbd,
+           LISTAGG(DISTINCT IFF("GROUP"<>'welcome_back_discount', "GROUP"||':'||monetary_field, NULL), ' | ') AS od
+    FROM proddb.public.maindblocal_order_cart_discount_component
+    WHERE created_at >= DATEADD('day', -1, $start_date::DATE) AND created_at < DATEADD('day', 2, $end_date::DATE)
+      AND LOWER(status) = 'applied'
+    GROUP BY 1
+), o AS (
+    SELECT dd.delivery_id, dd.creator_id, dd.business_name, dd.delivery_fee/100.0 AS fee,
+           CONVERT_TIMEZONE('UTC','America/Los_Angeles', dd.created_at)::DATE AS pdate,
+           COALESCE(x.wbd, 0) AS wbd, x.od
+    FROM EDW.FINANCE.DIMENSION_LOCAL_DELIVERIES dd
+    LEFT JOIN disc x ON x.order_cart_id = dd.order_cart_id
+    JOIN proddb.public.nv_wbd_can_daily_v3 f
+      ON f.consumer_id = dd.creator_id
+     AND f.ds = TO_VARCHAR(CONVERT_TIMEZONE('UTC','America/Los_Angeles', dd.created_at)::DATE)
+     AND f.ds >= $start_date AND f.ds < $end_date
+    WHERE dd.created_at >= DATEADD('day', -1, $start_date::DATE) AND dd.created_at < DATEADD('day', 2, $end_date::DATE)
+      AND CONVERT_TIMEZONE('UTC','America/Los_Angeles', dd.created_at)::DATE >= $start_date::DATE
+      AND CONVERT_TIMEZONE('UTC','America/Los_Angeles', dd.created_at)::DATE <  $end_date::DATE
+      AND dd.is_filtered_core = TRUE AND dd.country_id = $country_id
+      AND dd.is_subscribed_consumer = FALSE AND dd.is_bundle_order = FALSE
+      AND f.order_frequency_nv_all BETWEEN 0 AND $max_prior_nv_orders
+      AND EXISTS (SELECT 1 FROM edw.cng.dimension_new_vertical_store_tags b WHERE b.store_id = dd.store_id
+                  AND b.business_vertical_id IN (68,166,167,100,168,10606904,232,10000794,169,265,266,267,331,430,34,10606905,67,141))
+), fo AS (
+    SELECT consumer_id, MIN(first_order_date) AS first_order_date
+    FROM edw.growth.consumer_growth_accounting_scd3
+    WHERE scd_current_record = TRUE AND business_vertical_line = 'OVERALL'
+      AND consumer_id IN (SELECT creator_id FROM o)
+    GROUP BY 1
+), labeled AS (
+    SELECT DATE_TRUNC('week', o.pdate)::DATE AS week_start, o.wbd,
+           CASE WHEN o.wbd > 0 THEN '1 Got WBD'
+                WHEN o.od ILIKE '%first_delivery_promotion%' THEN '2 First-delivery promo'
+                WHEN o.business_name IN ('LCBO','The Beer Store') THEN '3 Alcohol store'
+                WHEN o.od ILIKE '%consumer_train_discount%' THEN '4 Train discount'
+                WHEN o.od ILIKE '%delivery_fee%' THEN '5 Other delivery-fee discount'
+                WHEN o.fee < 0.01 THEN '6 $0 delivery fee'
+                WHEN DATEDIFF('day', fo.first_order_date, o.pdate) <= $new_customer_days THEN '7 First order within N days'
+                ELSE '8 Unexplained' END AS reason
+    FROM o LEFT JOIN fo ON fo.consumer_id = o.creator_id
+)
+SELECT week_start,
+       SUBSTR(reason, 3) AS reason,
+       COUNT(*) AS orders,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY week_start), 1) AS pct_of_eligible_orders,
+       SUM(COUNT(*)) OVER (PARTITION BY week_start) AS total_eligible_orders,
+       ROUND(SUM(wbd), 2) AS wbd_usd
+FROM labeled
+GROUP BY week_start, reason
+ORDER BY week_start, reason;
